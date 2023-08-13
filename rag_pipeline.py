@@ -1,0 +1,161 @@
+import os
+from dotenv import load_dotenv
+import streamlit as st
+
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from openai import OpenAI
+
+load_dotenv()
+
+DB_PATH = "vector_db"
+HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+@st.cache_resource(show_spinner=False)
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is missing in environment variables.")
+    return OpenAI(api_key=api_key)
+
+
+@st.cache_resource(show_spinner=False)
+def get_embeddings():
+    # os.environ.setdefault("HF_HOME", ".cache/huggingface")
+    return HuggingFaceEmbeddings(model_name=HF_MODEL)
+
+
+@st.cache_resource(show_spinner=False)
+def get_db():
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(f"Vector DB not found at: {DB_PATH}")
+
+    embeddings = get_embeddings()
+    return Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+
+
+def answer_with_citations(question: str, chat_history=None, k: int = 4):
+    db = get_db()
+    client = get_openai_client()
+
+    docs = db.similarity_search(question, k=k)
+
+    # Build unique sources (same pdf + same page)
+    unique_sources = []
+    seen = set()
+    for d in docs:
+        src = d.metadata.get("source", "unknown").replace("\\", "/")
+        page = int(d.metadata.get("page", 0))
+        key = (src, page)
+        if key not in seen:
+            seen.add(key)
+            unique_sources.append({"source": src, "page": page})
+
+    # Build context with explicit source blocks
+    sources_text = []
+    for i, d in enumerate(docs, start=1):
+        src = d.metadata.get("source", "unknown").replace("\\", "/")
+        page = int(d.metadata.get("page", 0)) + 1
+        sources_text.append(
+            f"[SOURCE {i}] ({os.path.basename(src)}, page {page})\n{d.page_content[:1500]}"
+        )
+    context = "\n\n".join(sources_text)
+
+    prompt = f"""
+You are a company policy assistant.
+
+Use ONLY the information inside SOURCES.
+You may rephrase and explain in simple terms, but you MUST NOT add any new facts.
+Do NOT guess. If the answer is not present, reply exactly:
+Not found in the provided documents.
+
+Write the answer as a short professional paragraph (4–5 sentences).
+Do not use bullet points.
+Keep the tone formal and clear.
+
+SOURCES:
+{context}
+
+QUESTION:
+{question}
+""".strip()
+
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt
+    )
+
+    retrieved_chunks = [{"page_content": d.page_content} for d in docs]
+    return resp.output_text.strip(), unique_sources, retrieved_chunks
+
+def generate_related_questions_from_sources(sources, k=3):
+    """
+    Makes related questions ONLY from retrieved doc text.
+    sources: list of dicts containing page_content
+    """
+    if not sources:
+        return []
+
+    client = get_openai_client()  # ⭐ VERY IMPORTANT
+
+    text_blob = "\n\n".join(
+        (s.get("page_content") or "")[:1200]
+        for s in sources[:4]
+    )
+
+    prompt = f"""
+You are generating follow-up questions for a company policy chatbot.
+
+RULES:
+- Use ONLY the information in the CONTEXT.
+- Questions must be answerable from the context.
+- Do NOT create questions about anything not mentioned.
+- Return exactly {k} questions, one per line. No bullets, no numbering.
+
+CONTEXT:
+{text_blob}
+"""
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt
+    )
+
+    lines = [q.strip("-• ").strip() for q in resp.output_text.split("\n") if q.strip()]
+    return lines[:k]
+
+
+
+def suggest_related_questions(question: str, sources: list, n: int = 3):
+    client = get_openai_client()
+
+    short_context = "\n".join(
+        [f"- {os.path.basename(s.get('source', 'unknown'))} (page {int(s.get('page', 0)) + 1})"
+         for s in sources]
+    )
+
+    prompt = f"""
+You are helping a user explore internal policy documents.
+
+User asked:
+{question}
+
+Docs used:
+{short_context}
+
+Suggest {n} short follow-up questions.
+Rules:
+- Must relate to company policies / security / IT procedures.
+- Must be phrased as questions.
+- Output ONLY questions, one per line.
+""".strip()
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt
+    )
+
+    lines = [ln.strip() for ln in resp.output_text.split("\n") if ln.strip()]
+    return lines[:n]
